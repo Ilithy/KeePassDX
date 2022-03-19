@@ -41,7 +41,6 @@ import com.kunzisoft.keepass.app.database.CipherDatabaseAction
 import com.kunzisoft.keepass.settings.PreferencesUtil
 import java.security.KeyStore
 import java.security.UnrecoverableKeyException
-import java.util.concurrent.Executors
 import javax.crypto.BadPaddingException
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
@@ -52,6 +51,7 @@ import javax.crypto.spec.IvParameterSpec
 class AdvancedUnlockManager(private var retrieveContext: () -> FragmentActivity) {
 
     private var keyStore: KeyStore? = null
+    private var keyStoreLoaded: Boolean = false
     private var keyGenerator: KeyGenerator? = null
     private var cipher: Cipher? = null
 
@@ -124,51 +124,57 @@ class AdvancedUnlockManager(private var retrieveContext: () -> FragmentActivity)
         }
     }
 
+    private fun loadKeyStore() {
+        try {
+            if (!keyStoreLoaded) {
+                keyStore?.load(null)
+                keyStoreLoaded = true
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Unable to load the keystore", e)
+            advancedUnlockCallback?.onGenericException(e)
+        }
+    }
+
     private fun getSecretKey(): SecretKey? {
         if (!isKeyManagerInitialized) {
             return null
         }
-        try {
-            // Create new key if needed
-            keyStore?.let { keyStore ->
-                keyStore.load(null)
-
-                try {
-                    if (!keyStore.containsAlias(ADVANCED_UNLOCK_KEYSTORE_KEY)) {
-                        // Set the alias of the entry in Android KeyStore where the key will appear
-                        // and the constrains (purposes) in the constructor of the Builder
-                        keyGenerator?.init(
-                                KeyGenParameterSpec.Builder(
-                                    ADVANCED_UNLOCK_KEYSTORE_KEY,
-                                    KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT)
-                                    .setBlockModes(KeyProperties.BLOCK_MODE_CBC)
-                                    .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_PKCS7)
-                                    .apply {
-                                        // Require the user to authenticate with a fingerprint to authorize every use
-                                        // of the key, don't use it for device credential because it's the user authentication
-                                        if (biometricUnlockEnable) {
-                                            setUserAuthenticationRequired(true)
-                                        }
-                                        // To store in the security chip
-                                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P
-                                            && retrieveContext().packageManager.hasSystemFeature(
-                                                PackageManager.FEATURE_STRONGBOX_KEYSTORE)) {
-                                            setIsStrongBoxBacked(true)
-                                        }
+        // Create new key if needed
+        keyStore?.let { keyStore ->
+            loadKeyStore()
+            try {
+                if (!keyStore.containsAlias(ADVANCED_UNLOCK_KEYSTORE_KEY)) {
+                    // Set the alias of the entry in Android KeyStore where the key will appear
+                    // and the constrains (purposes) in the constructor of the Builder
+                    keyGenerator?.init(
+                            KeyGenParameterSpec.Builder(
+                                ADVANCED_UNLOCK_KEYSTORE_KEY,
+                                KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT)
+                                .setBlockModes(KeyProperties.BLOCK_MODE_CBC)
+                                .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_PKCS7)
+                                .apply {
+                                    // Require the user to authenticate with a fingerprint to authorize every use
+                                    // of the key, don't use it for device credential because it's the user authentication
+                                    if (biometricUnlockEnable) {
+                                        setUserAuthenticationRequired(true)
                                     }
-                                    .build())
-                        keyGenerator?.generateKey()
-                    }
-                } catch (e: Exception) {
-                    Log.e(TAG, "Unable to create a key in keystore", e)
-                    advancedUnlockCallback?.onGenericException(e)
+                                    // To store in the security chip
+                                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P
+                                        && retrieveContext().packageManager.hasSystemFeature(
+                                            PackageManager.FEATURE_STRONGBOX_KEYSTORE)) {
+                                        setIsStrongBoxBacked(true)
+                                    }
+                                }
+                                .build())
+                    keyGenerator?.generateKey()
                 }
 
                 return keyStore.getKey(ADVANCED_UNLOCK_KEYSTORE_KEY, null) as SecretKey?
+            } catch (e: Exception) {
+                Log.e(TAG, "Unable to retrieve the key from the keystore", e)
+                advancedUnlockCallback?.onGenericException(e)
             }
-        } catch (e: Exception) {
-            Log.e(TAG, "Unable to retrieve the key in keystore", e)
-            advancedUnlockCallback?.onGenericException(e)
         }
         return null
     }
@@ -297,11 +303,11 @@ class AdvancedUnlockManager(private var retrieveContext: () -> FragmentActivity)
     }
 
     fun deleteKeystoreKey() {
+        loadKeyStore()
         try {
-            keyStore?.load(null)
             keyStore?.deleteEntry(ADVANCED_UNLOCK_KEYSTORE_KEY)
         } catch (e: Exception) {
-            Log.e(TAG, "Unable to delete entry key in keystore", e)
+            Log.e(TAG, "Unable to delete entry key in the keystore", e)
             advancedUnlockCallback?.onGenericException(e)
         }
     }
@@ -309,16 +315,18 @@ class AdvancedUnlockManager(private var retrieveContext: () -> FragmentActivity)
     fun openAdvancedUnlockPrompt(cryptoPrompt: AdvancedUnlockCryptoPrompt,
                                  deviceCredentialResultLauncher: ActivityResultLauncher<Intent>
     ) {
+        val context = retrieveContext()
         // Init advanced unlock prompt
         if (biometricPrompt == null) {
-            biometricPrompt = BiometricPrompt(retrieveContext(),
-                    Executors.newSingleThreadExecutor(),
-                    authenticationCallback)
+            biometricPrompt = BiometricPrompt(context,
+                ContextCompat.getMainExecutor(context),
+                authenticationCallback
+            )
         }
 
-        val promptTitle = retrieveContext().getString(cryptoPrompt.promptTitleId)
+        val promptTitle = context.getString(cryptoPrompt.promptTitleId)
         val promptDescription = cryptoPrompt.promptDescriptionId?.let { descriptionId ->
-            retrieveContext().getString(descriptionId)
+            context.getString(descriptionId)
         } ?: ""
 
         if (cryptoPrompt.isBiometricOperation) {
@@ -330,7 +338,7 @@ class AdvancedUnlockManager(private var retrieveContext: () -> FragmentActivity)
                 if (isDeviceCredentialBiometricOperation()) {
                     setAllowedAuthenticators(DEVICE_CREDENTIAL)
                 } else {
-                    setNegativeButtonText(retrieveContext().getString(android.R.string.cancel))
+                    setNegativeButtonText(context.getString(android.R.string.cancel))
                 }
             }.build()
             biometricPrompt?.authenticate(
@@ -338,7 +346,7 @@ class AdvancedUnlockManager(private var retrieveContext: () -> FragmentActivity)
                     BiometricPrompt.CryptoObject(cryptoPrompt.cipher))
         }
         else if (cryptoPrompt.isDeviceCredentialOperation) {
-            val keyGuardManager = ContextCompat.getSystemService(retrieveContext(), KeyguardManager::class.java)
+            val keyGuardManager = ContextCompat.getSystemService(context, KeyguardManager::class.java)
             @Suppress("DEPRECATION")
             deviceCredentialResultLauncher.launch(
                 keyGuardManager?.createConfirmDeviceCredentialIntent(promptTitle, promptDescription)
